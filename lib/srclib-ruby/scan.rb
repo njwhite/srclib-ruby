@@ -14,92 +14,79 @@ module Srclib
       OptionParser.new do |opts|
         opts.banner = "Usage: scan [options]"
         opts.on("--repo URI", "URI of repository") do |v|
-          @opt[:repo] = v
+          @repo = v
         end
         opts.on("--subdir DIR", "path of current dir relative to repo root") do |v|
-          @opt[:repo_subdir] = v
+          Dir.chdir(v)
         end
       end
     end
 
     def run(args)
       option_parser.order!
-      raise "no args may be specified to scan (got #{args.inspect}); it only scans the current directory" if args.length != 0
 
       pre_wd = Pathname.pwd
 
       # Keep track of already discovered files in a set
-      discovered_files = Set.new
+      discovered_deps, discovered_files = Set.new, Set.new
+      source_units = []
 
-      source_units = find_gems('.').map do |gemspec, gem|
+      find_gemspecs(pre_wd).each do |gemspec|
         Dir.chdir(File.dirname(gemspec))
+
         if File.exist?("Gemfile")
-          deps = Bundler.definition.dependencies.map{ |d| [d.name, d.requirement.to_s] }
+          Bundler.definition.specs # force evaluation of lazy specs
+          Bundler.definition.resolve.each do |dep|
+            next if not discovered_deps.add? dep.name
+            next if dep.default_gem?
+
+            Dir.chdir(dep.full_gem_path)
+            source_units << unit_from_spec(
+              dep,
+              dep.full_gem_path,
+              discovered_files)
+          end
+        else
+          # just the one gem
+          source_units << unit_from_spec(
+            Gem::Specification.load(gemspec),
+            File.dirname(gemspec),
+            discovered_files)
         end
 
-        gem_dir = Pathname.new(gemspec).relative_path_from(pre_wd).parent
-
-        gem.delete(:date)
-
-        # Add set of all now accounted for files, using absolute paths
-        discovered_files.merge(gem[:files].sort.map { |x| File.expand_path(x) } )
-
-        {
-          'Name' => gem[:name],
-          'Type' => 'rubygem',
-          'Dir' => gem_dir,
-          'Files' => gem[:files].sort.map { |f| gem_dir == "." ? f : File.join(gem_dir, f) },
-          'Dependencies' => (deps and deps.sort), #gem[:dependencies], # TODO(sqs): what to do with the gemspec deps?
-          'Data' => gem,
-          'Ops' => {'depresolve' => nil, 'graph' => nil},
-        }
       end
 
-      # Ignore standard library
-      if @opt[:repo] != "github.com/ruby/ruby"
-        Dir.chdir(pre_wd) # Reset working directory to initial root
-        scripts = find_scripts('.', source_units).map do |script_path|
-          Pathname.new(script_path).relative_path_from(pre_wd)
-        end
-
-        # Filter out scripts that are already accounted for in the existing Source Units
-        scripts = scripts.select do |script_file|
-          script_absolute = File.expand_path(script_file)
-          member = discovered_files.member? script_absolute
-          !member
-        end
-        scripts.sort! # For testing consistency
-
-        # If scripts were found, append to the list of source units
-        if scripts.length > 0
+      find_scripts(pre_wd).
+        reject {|script| discovered_files.include? script}.
+        each do |script|
           source_units << {
-            'Name' => '.',
+            'Name' => File.basename(gemspec).sub(/.rb$/, ''),
             'Type' => 'rubyprogram',
-            'Dir' => '.',
-            'Files' => scripts,
+            'Dir' => File.dirname(script),
+            'Files' => [script],
             'Dependencies' => nil, #TODO(rameshvarun): Aggregate dependencies from all of the scripts
             'Data' => {
               'name' => 'rubyscripts',
-              'files' => scripts,
+              'files' => [script],
             },
             'Ops' => {'depresolve' => nil, 'graph' => nil},
           }
         end
-      end
 
+      source_units.each {|u| u['Repo'] = @repo } if not @repo.nil?
       puts JSON.generate(source_units.sort_by { |a| a['Name'] })
-    end
-
-    def initialize
-      @opt = {}
     end
 
     private
 
+    def find_gemspecs dir
+      Dir.glob(File.join(File.expand_path(dir), "**/*.gemspec")).sort
+    end
+
     # Finds all scripts that are not accounted for in the existing set of found gems
     # @param dir [String] The directory in which to search for scripts
     # @param gem_units [Array] The source units that have already been found.
-    def find_scripts(dir, gem_units)
+    def find_scripts dir
       scripts = []
 
       dir = File.expand_path(dir)
@@ -110,54 +97,30 @@ module Srclib
       scripts
     end
 
-    # Given the content of a script, finds all of its dependant gems
-    # @param script_code [String] Content of the script
-    # @return [Array] The dependency array.
-    def script_deps(script_code)
-      # Get a list of all installed gems
-      installed_gems = `gem list`.split(/\n/).map do |line|
-        line.split.first.strip #TODO: Extract version number
+    def unit_from_spec spec, dir, discovered_files
+      files = spec.files.select { |f| f.end_with? '.rb'}.map{|f| File.join(dir, f) }
+
+      spec.require_paths.each do |path|
+        files += Dir.glob(File.join(dir, path, '**', '*.rb'))
       end
 
-      deps = []
-      script_code.scan(/require\W["'](.*)["']/) do |required|
-        if installed_gems.include? required[0].strip
-          deps << [
-            required[0].strip,
-            ">= 0" #TODO: Should use the currently installed version number
-          ]
-        end
+      spec.executables.each do |exe|
+        files << File.join(dir, spec.bindir, exe)
       end
 
-      return deps
-    end
+      files.sort!
+      files.uniq!
+      files.each {|f| discovered_files.add f}
 
-    def find_gems(dir)
-      dir = File.expand_path(dir)
-      gemspecs = {}
-      spec_files = Dir.glob(File.join(dir, "**/*.gemspec")).sort
-      spec_files.each do |spec_file|
-        Dir.chdir(File.expand_path(File.dirname(spec_file), dir))
-        spec = Gem::Specification.load(spec_file)
-        if spec
-          spec.normalize
-          o = {}
-          spec.class.attribute_names.find_all do |name|
-            v = spec.instance_variable_get("@#{name}")
-            o[name] = v if v
-          end
-          if o[:files]
-            o[:files].sort!
-          end
-          if o[:metadata] && o[:metadata].empty?
-            o.delete(:metadata)
-          end
-          o.delete(:rubygems_version)
-          o.delete(:specification_version)
-          gemspecs[spec_file] = o
-        end
-      end
-      gemspecs
+      {
+        'Name' => spec.name,
+        'Type' => 'rubygem',
+        'Dir' => dir,
+        'Files' => files,
+        'Dependencies' => spec.dependencies.map {|d| [d.name, d.requirement.to_s] },
+        'Data' => {},
+        'Ops' => {'depresolve' => nil, 'graph' => nil},
+      }
     end
   end
 end
